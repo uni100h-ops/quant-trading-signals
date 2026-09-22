@@ -1,0 +1,16 @@
+# PRIVATE entry-signal engine: server-only, never published.
+# If this line is removed and the file committed, the paid product is given away.
+estrategia.py
+
+.venv/
+estado/
+estado_servidor/
+__pycache__/
+*.pyc
+log.txt
+*.env
+*.sqlite3*
+*.log
+config.local.txt
+wheels_windows/
+dist/

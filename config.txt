@@ -1,0 +1,24 @@
+# Customer settings only. Provider addresses and prices are embedded in agente.py.
+[account]
+mode = paper
+network = mainnet
+wallet_hyperliquid =
+wallet_algorand_payments =
+
+[operations]
+capital_per_entry_pct = 100
+max_entries = 3
+
+[billing]
+daily_limit_usdc = 0.50
+total_limit_usdc = 10.00
+algod_url = https://mainnet-api.algonode.cloud
+
+[setup]
+completed = no
+acceptance_sha256 =
+
+[server]
+facilitator_url = https://facilitator.goplausible.xyz
+host = 127.0.0.1
+port = 8000
