@@ -1,51 +1,96 @@
-Server side of QUANT TRADING SIGNALS. Render deploys from this repository.
+# QUANT TRADING SIGNALS (QTS)
 
-This repository must stay private. estrategia.py is the paid product: it holds the sweep/context layer, the entry rule and every tuned parameter. If it becomes public, the product is given away — a customer's agent could then decide entries locally and skip both fees.
+**Automated BTC/USDC trading on Hyperliquid — runs on your own computer, pays per use on Algorand.**
 
-Files
-File	Why it's here
-estrategia.py	The private entry engine. Never distributed, never committed to the public repo.
-agente.py	Same file customers get. --servir runs the API; it imports estrategia.py.
-config.txt	Server settings: facilitator URL, host, port. Required by the Dockerfile.
-requirements.lock	Pinned dependencies with hashes.
-Dockerfile	Render build. Runs python agente.py --servir.
+QTS is a local Python agent. It watches the market, opens qualifying trades and manages a dynamic stop as conditions change. You keep custody of your wallets and can stop the agent at any time.
 
-Keep agente.py, config.txt and requirements.lock in sync with the public repo. Only estrategia.py is exclusive to this one.
+Entry signals are computed by the publisher's service and paid for with Algorand x402 micropayments. Protecting an open position — stop placement, trailing, emergency exit — runs locally, so a network or service outage can never leave a funded position unmanaged.
 
-Before first deploy
-Embed the publisher policy. On a local copy, run python agente.py --preparar-publicacion and enter the Render HTTPS URL, the Hyperliquid builder address and the Algorand payout address. This rewrites PUBLISHER_POLICY inside agente.py. Commit that result here and in the public repo — they must be byte-identical, or the customer's setup wizard rejects the service terms.
-Confirm config.txt is present here. The Dockerfile copies it; the build fails without it. Use [server] host = 0.0.0.0 for a container.
-Fund the builder account so its Hyperliquid perpetual account value meets the 100 USDC minimum, in standard account mode. Confirm the payout wallet's USDC opt-in.
-Deploy on Render
-Point the service at this repository. Dockerfile is the runtime; the port is read from Render's environment.
-No API key, private key or customer credential belongs in this repo or in Render's environment. The service receives no keys and cannot execute trades.
-After deploy, check /health and /v1/terms. /v1/terms must show version 2.2.0 and builder_scope: exits_only. If it still shows 2.1.0, the deploy didn't apply.
---servir refuses to start if estrategia.py is missing or the publisher policy is blank. That's deliberate.
-Free tier trade-off
+## Download
 
-Render Free sleeps after 15 idle minutes and cold-starts. Entries now depend on this service, so a cold start can miss a signal's freshness window (60 s) and skip a valid entry. It cannot leave a position unprotected — stop management runs on the customer's machine. For a pilot, Free is fine; with paying customers, a plan that doesn't sleep is worth it.
+**[Download the Windows installer](../../releases/latest)** — one ZIP with everything bundled, including dependencies.
 
-Local files are lost on restart or redeploy, so the payment journal in estado_servidor/ does not survive. Before charging real customers, move it to a persistent disk or an external store.
+Prefer to clone? `git clone` this repository and run `instalar.sh` (macOS/Linux) or `INSTALAR.bat` (Windows). Cloning installs dependencies from PyPI instead of the bundled wheels, so you'll need an internet connection during setup.
 
-Endpoints
-Endpoint	Paid?	What it does
-GET /health	no	Liveness.
-GET /v1/terms	no	Published fee terms. Must match the customer's embedded policy.
-POST /v1/signal/BTC	activation required	The entry decision. Returns signal (-1/0/+1) and risk_atr.
-POST /v1/audit	x402	Activation and closed-position receipts.
+## Before you start
 
-/v1/signal/BTC requires a signed request from an activated payer and rejects stale timestamps (over 60 s). It charges nothing per call — the x402 payments happen at activation and on close.
+- Windows 10/11, macOS, or Linux. Python 3.12 is installed for you on Windows.
+- A Hyperliquid account with **at least 100 USDC** in futures equity, standard account mode.
+- A secondary Algorand wallet, already activated (0.2 ALGO reserve + USDC opt-in), funded with **at least 2 USDC**.
+- An internet connection while the agent runs.
 
-Security checklist
-2FA on the GitHub and Render accounts. Whoever gets in there gets the strategy.
-git status before every push to the public repo: estrategia.py is in its .gitignore, but check anyway.
-An activated customer can poll /v1/signal/BTC candle by candle and log the answers. Enough history could let someone approximate the entry timing. That's inherent to selling signals and no hosting choice fixes it.
-Keeping the strategy intact
+## Install & run (Windows)
 
-estrategia.py was verified to produce identical output to the original monolithic version — signal and risk_atr bit-for-bit, across a sample containing real entries. Two things to respect when editing:
+1. **Extract the ZIP** into its own folder — don't run it from inside the ZIP.
+2. Double-click **`INSTALAR.bat`**. It sets up a local environment and walks you through entering your Hyperliquid public address, a **separate API wallet key**, and your Algorand payment wallet key. **Never enter your main wallet's seed phrase — anywhere.**
+3. Review the fee terms it shows you and approve them in your wallet when asked.
+4. When you see **SETUP COMPLETE**, double-click **`INICIAR.bat`** and keep that window open — that's the agent running.
 
-The entry signal is the filtered EMA cross. The sweep/context layer contributes only its ATR, used as risk_atr. Do not turn it into an AND of both layers — that silently changes the strategy the backtest was run against.
-Indicator periods in agente.py (StopIndicators: EMA 34/89, RSI 14, ATR 7) must match the ones here. They stay client-side because trailing stops need them.
-Related
-Public repo: https://github.com/uni100h-ops/quant-trading-signals
-Existing x402 competition endpoint (separate, unaffected): https://github.com/uni100h-ops/x402-quant-signals
+**New to QTS? Run `PROBAR_PAPER.bat` first.** It runs the agent's plumbing with no keys and no real payments, so you can see how it behaves before risking anything.
+
+**macOS / Linux:** install Python 3.12, then `./instalar.sh` followed by `./iniciar.sh`.
+
+## Your wallets
+
+| Wallet | What it's for | Minimum |
+|---|---|---|
+| Hyperliquid trading wallet | Holds your trading capital (USDC) | 100 USDC in futures equity |
+| Hyperliquid API wallet | Separate key QTS uses to sign orders — create it at the [Hyperliquid API page](https://app.hyperliquid.xyz/API). Never your seed. | — |
+| Algorand payment wallet | Pays the activation and exit-service fees (Algorand mainnet USDC, ASA 31566704) | 2 USDC, wallet already activated |
+
+Keys are stored in your operating system's protected credential store (Windows Credential Manager, macOS Keychain, Linux Secret Service) — never in `config.txt` or `log.txt`.
+
+## Fees
+
+Both QTS fees are charged **only when a position closes**. Opening a trade never requires payment, and a protective stop or exit is never held up waiting on one.
+
+| Fee | Rate | Goes to |
+|---|---|---|
+| QTS developer commission | 0.10% of the closing fill (Hyperliquid Builder code) | QTS developer |
+| Hyperliquid exchange fee | ~0.045% taker, per fill | Hyperliquid |
+| QTS service payment (x402) | 0.01 USDC per one-time activation and per closed-position receipt | QTS service, via Algorand |
+| Algorand network fee | Sponsored — no extra cost to you | — |
+
+Default spending caps are **0.50 USDC/day** and **10 USDC total**. You can lower these during setup.
+
+## How it works
+
+```
+Your computer                          Publisher's server
+─────────────                          ──────────────────
+agente.py                              agente.py --servir
+  ├─ fetches BTC candles                 ├─ computes the entry signal
+  ├─ asks the service: enter? ─────────► └─ answers (activation required)
+  ├─ places and manages the order
+  ├─ runs the stop locally, always
+  └─ pays on close ────────────────────► x402 settlement on Algorand
+```
+
+The entry-signal engine is not part of this repository: it runs server-side, which is what the x402 payment buys.
+
+## While it's running
+
+- The console and `log.txt` show scans, entries, stop changes, payments and exits. Open the log anytime with **`VER_LOG.bat`**.
+- **Ctrl+C** stops the agent. Any live exchange stop-loss stays in place — it just stops adjusting.
+- Restarting preserves your trading and payment state. Don't delete `config.txt` or the `estado/` folder.
+
+## Good to know
+
+- Historical simulation (BTC/USDC, 5-minute candles, 12 months): **+238.57%** return, 35.04% max drawdown, 65% win rate. **This predates the current fees and live checks — it's a simulation, not a forecast, and it does not establish the performance of this fee-bearing version.** Full numbers: `docs/BACKTEST_REFERENCE.json`.
+- Trading perpetual futures with leverage can lose money quickly, including more than you intend. Start in paper mode.
+- Verification status and known open items: `docs/VERIFICACION.json`.
+- Third-party licenses: `docs/THIRD_PARTY.md`.
+
+## Repository layout
+
+| Path | What it is |
+|---|---|
+| `agente.py` | The agent. Client mode for customers; `--servir` runs the publisher's API. |
+| `config.txt` | Customer settings. Shipped blank, in paper mode. |
+| `instalar.*` / `*.bat` | Guided installer and launchers. |
+| `tests/test_qts.py` | 46 offline tests — no network, no funded keys. |
+| `docs/` | Verification records, backtest reference, publisher guide, licenses. |
+| `media/` | Demo video and captions. |
+
+Run the tests with `python -m unittest tests.test_qts`.
+
