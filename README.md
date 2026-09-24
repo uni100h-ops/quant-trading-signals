@@ -1,6 +1,6 @@
 # QUANT TRADING SIGNALS
 
-A local BTC/USDC trading agent for Hyperliquid. Private entry signals come from the QTS service; your computer manages positions and exchange stop orders.
+A local BTC/USDC trading agent: **Binance USD-M BTCUSDC data**, with **orders and native stops on Hyperliquid**. Private entry signals come from the QTS service; your computer manages open positions.
 
 ## Install on Windows
 
@@ -16,14 +16,16 @@ Keys stay in **Windows Credential Manager**, never in `config.txt` or the log. U
 
 ## Start, stop and restart
 
-- **INICIAR.bat** starts the configured mode. Each completed 5-minute candle is evaluated; a qualifying new crossover is required. Existing EMA alignment alone does not authorize an entry.
+- **INICIAR.bat** starts the configured mode. Each completed Binance 5-minute candle is evaluated; a qualifying new crossover is required. Existing EMA alignment alone does not authorize an entry.
 - **VER_LOG.bat** follows `log.txt` while the agent runs. Each line starts with date and time. Scans explain both BUY and SELL rejections; open positions show their stop status.
 - To restart, press **Ctrl+C in the agent window**, wait for **STOPPED**, close that window, then open **INICIAR.bat once** from the **same folder**. Keep `config.txt`, `.venv` and `estado/`. Do not run setup again for an ordinary restart.
 - Restart checks saved state against Hyperliquid before acting. It does not replay missed historical entries. A confirmed exchange stop remains while the agent is stopped, but it does not keep advancing.
 - `log.txt` starts a new session on restart. Copy it first if you want to keep the previous session. Trading and payment state remain in `estado/`.
 - **PROBAR_PAPER.bat** is a public-data monitor. It needs no keys, makes no payments, and **does not simulate the private entry strategy**.
 
-For an update, extract the new ZIP separately. Stop the agent as above, then replace the code, launchers and documentation in the existing installation. **Keep your existing `config.txt`, `estado/` and `.venv`**. Run `INSTALAR.bat` only if dependencies or accepted terms changed. Never create a second live installation for the same account.
+This build is **2.2.0-binance-restored.1**. It includes `binance_seed.zip`, a verified public-data cache with the original indicator seed. The cache then updates from Binance. Keep it beside `agente.py`. Historical entries are never opened on installation or restart.
+
+For an update, extract the new ZIP separately. Stop the agent as above, then replace `agente.py`, `binance_seed.zip`, launchers and documentation in the existing installation. **Keep your existing `config.txt`, `estado/` and `.venv`**. Run `INSTALAR.bat` only if dependencies or accepted terms changed. Never create a second live installation for the same account. An existing Hyperliquid-data position keeps its old stop inputs until it closes; additions are paused during that transition. The new Binance feed starts when the account is flat.
 
 ## Position size and fees
 
@@ -42,6 +44,17 @@ Default x402 spending limits are **0.50 USDC per UTC day** and **10 USDC total**
 
 ## Historical simulation
 
-**Hyperliquid, September 11–24, 2026: −3.47% account return; 6.56% maximum sampled drawdown.** One position closed and one remained open. The simulation uses 5-minute traded candles, approximate mark-trigger execution and costs; it is not live performance or a future-return promise. The former annual Binance +238% result is a different dataset and test.
+**The original annual Binance benchmark is restored: +238.57%.**
+
+Period: **September 21, 2025 to September 21, 2026**, both at 17:25 UTC. Starting capital: 10,000 USDC. 43 closed positions / 107 entry legs. Maximum drawdown: **35.04%**. The full agent replay also rounds to +238.57%.
+
+| Same Binance sample | Return | Maximum drawdown |
+|---|---:|---:|
+| Original cost model | **+238.57%** | 35.04% |
+| With current QTS developer and x402 fees | **+204.77%** | 35.46% |
+
+The original model includes 0.045% exchange fees per fill, 2 bps slippage and historical Binance funding. Current QTS fees were added later; they are included only in the second row. Results are compounded simulations on a retrospectively optimized dataset, not independent validation or live Hyperliquid performance. The original September record includes losses as well as a profitable September 8–16 position.
+
+Binance supplies indicators and the funding filter. Hyperliquid determines real fills, mark-trigger stops and actual funding payments. Entries are skipped if price deviates more than 0.30% from the Binance signal close. Binance outages or source-version mismatches pause new entries; confirmed Hyperliquid stops remain active. Different exchange prices, costs and availability can produce different live trades.
 
 macOS/Linux: install Python 3.12, run `./instalar.sh`, then `./iniciar.sh`. Dependency notices are in `docs/THIRD_PARTY.md`.

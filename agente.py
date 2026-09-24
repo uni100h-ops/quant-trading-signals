@@ -557,6 +557,63 @@ class PublicAPI:
                 'mark':float(ctx[i]['markPx']),'time':int(time.time()*1000)}
 
 
+# A fixed source/seed contract is shared by the private service and local stops.
+# Changing source never reuses another venue's candles or position journal.
+MARKET_SOURCE='binance-usdm:BTCUSDC:5m:v1'
+BENCHMARK_START_MS=1758475500000
+BINANCE_SEED_MS=1758412500000
+
+class BinanceDataAPI:
+    """Read-only public USD-M BTCUSDC data. Never submits Binance orders.
+
+    No spot/USDT fallback: a different instrument would change the strategy.
+    The broker and its account, quote, fills and native stops stay Hyperliquid.
+    """
+    base_url='https://fapi.binance.com'
+    source=MARKET_SOURCE
+    max_candle_window=None
+    def __init__(self,log=None,progress=None):
+        self.session=requests.Session();self.log=log;self.progress=progress
+    def get(self,path,params):
+        try:
+            r=self.session.get(self.base_url+path,params=params,timeout=(20,20))
+            if r.status_code in (403,451):
+                raise TemporaryError('Binance data access is restricted here; no source substitution; new entries paused')
+            if r.status_code in (418,429):raise TemporaryError('Binance data rate limit; retry later')
+            r.raise_for_status();payload=r.json()
+            if not isinstance(payload,list):raise ValueError('Expected a list')
+            return payload
+        except (requests.RequestException,ValueError) as e:
+            raise TemporaryError('Binance public data unavailable ('+type(e).__name__+')') from None
+    def candles(self,interval,start,end):
+        step={'5m':BAR_MS,'12h':43_200_000}[interval]
+        rows=[];cursor=start
+        while cursor<=end:
+            batch=self.get('/fapi/v1/klines',{'symbol':'BTCUSDC','interval':interval,
+                      'startTime':cursor,'endTime':end,'limit':1000})
+            if not batch:break
+            parsed=[dict(t=int(x[0]),T=int(x[6]),o=x[1],h=x[2],l=x[3],c=x[4],v=x[5]) for x in batch]
+            if parsed[0]['t']<cursor or any(b['t']<=a['t'] for a,b in zip(parsed,parsed[1:])):
+                raise SafetyError('Binance candles did not advance')
+            rows.extend(parsed);cursor=parsed[-1]['t']+step
+            if self.progress:self.progress()
+            if self.log and end-start>1000*step:
+                self.log.info('BINANCE HISTORY | %s | %s closed candles downloaded | fixed benchmark seed',interval,len(rows))
+        return rows
+    def funding(self,start,end):
+        rows=[];cursor=start
+        while cursor<=end:
+            batch=self.get('/fapi/v1/fundingRate',{'symbol':'BTCUSDC','startTime':cursor,'endTime':end,'limit':1000})
+            if not batch:break
+            parsed=[{'time':int(x['fundingTime']),'fundingRate':x['fundingRate'],
+                     'markPrice':x.get('markPrice')} for x in batch]
+            if any(x['time']<cursor or x['time']>end for x in parsed):raise SafetyError('Invalid Binance funding time')
+            rows.extend(parsed);cursor=max(x['time'] for x in parsed)+1
+            if self.progress:self.progress()
+            if len(batch)<1000:break
+        return rows
+
+
 def normalize_candle(row,step):
     r={k:float(row[k]) for k in ('o','h','l','c','v')};r.update(t=int(row['t']),T=int(row['T']))
     if (not all(math.isfinite(r[k]) for k in ('o','h','l','c','v')) or r['v']<0 or
@@ -569,11 +626,25 @@ class Market:
     def __init__(self,api,store,management,indicators,stop,log,delay_seconds=2):
         self.api=api;self.store=store;self.management=management;self.indicators=indicators;self.stop=stop
         self.log=log;self.delay=int(delay_seconds*1000)
+        seed=Path(__file__).with_name('binance_seed.zip')
+        if getattr(self.api,'source',None)==MARKET_SOURCE and self.store.last_candle('5m') is None and seed.is_file():
+            import zipfile
+            with zipfile.ZipFile(seed) as z:
+                m=json.loads(z.read('manifest.json'))
+                for name in ('BTC_5m.json','BTC_12h.json','BTC_funding.json'):
+                    payload=z.read(name)
+                    if hashlib.sha256(payload).hexdigest()!=m['files'][name]:raise SafetyError('Binance seed checksum mismatch')
+                    rows=json.loads(payload)
+                    if name=='BTC_funding.json':self.store.add_funding(rows)
+                    else:self.store.add_candles('5m' if name=='BTC_5m.json' else '12h',rows)
     def sync(self,now):
         boundary=(now-self.delay)//BAR_MS*BAR_MS
         manifest=self.store.get('market_manifest')
         if not manifest:
-            manifest={'test_start_ms':boundary,'network':self.api.base_url,'seed_5m':boundary-1200*BAR_MS}
+            manifest=({'test_start_ms':BENCHMARK_START_MS,'network':self.api.base_url,
+                       'source':MARKET_SOURCE,'seed_5m':BINANCE_SEED_MS}
+                      if getattr(self.api,'source',None)==MARKET_SOURCE else
+                      {'test_start_ms':boundary,'network':self.api.base_url,'seed_5m':boundary-1200*BAR_MS})
             self.store.put('market_manifest',manifest)
         if manifest['network']!=self.api.base_url:raise SafetyError('History belongs to another network')
         anchor=(manifest['test_start_ms']//43_200_000-400)*43_200_000
@@ -581,15 +652,20 @@ class Market:
             last=self.store.last_candle(interval)
             begin=seed if last is None else last+step
             expected_end=boundary//step*step
-            if begin<expected_end:
-                if expected_end-begin>4998*step:
+            while begin<expected_end:
+                if getattr(self.api,'max_candle_window',4998) is not None and expected_end-begin>4998*step:
                     raise SafetyError('Disconnection exceeds the Hyperliquid candle window; incomplete history, refusing to recalculate with a different indicator seed')
-                batch=self.api.candles(interval,begin,expected_end-1)
-                rows=[normalize_candle(x,step) for x in batch if int(x['t'])>=begin and int(x['T'])+1<=expected_end]
+                # Commit each verified page. Bootstrap resumes here after an outage.
+                chunk_end=min(expected_end,begin+1000*step) if getattr(self.api,'source',None)==MARKET_SOURCE else expected_end
+                batch=self.api.candles(interval,begin,chunk_end-1)
+                rows=[normalize_candle(x,step) for x in batch if int(x['t'])>=begin and int(x['T'])+1<=chunk_end]
                 rows=sorted({r['t']:r for r in rows}.values(),key=lambda r:r['t'])
-                if not rows or rows[0]['t']!=begin or rows[-1]['T']+1!=expected_end or any(b['t']-a['t']!=step for a,b in zip(rows,rows[1:])):
+                if not rows or rows[0]['t']!=begin or rows[-1]['T']+1!=chunk_end or any(b['t']-a['t']!=step for a,b in zip(rows,rows[1:])):
                     raise TemporaryError(f'Missing closed {interval} candles; incomplete signals are not evaluated')
-                self.store.add_candles(interval,rows)
+                self.store.add_candles(interval,rows);begin=chunk_end
+                if getattr(self.api,'source',None)==MARKET_SOURCE and chunk_end<expected_end:
+                    self.log.info('BINANCE HISTORY | %s | cached through %s UTC | fixed seed; bootstrap can resume',
+                                  interval,datetime.fromtimestamp(chunk_end/1000,timezone.utc).isoformat())
         funding=self.store.funding()
         # A small overlap lets the latest hourly publication be received.
         begin=max(manifest['seed_5m']-9*3600_000,int(funding[-1]['time'])-3600_000) if funding else manifest['seed_5m']-9*3600_000
@@ -607,7 +683,8 @@ class Market:
                 'ema_fast':float(feature['ema_fast'][i]),'ema_slow':float(feature['ema_slow'][i]),
                 'atr':float(feature['stop_atr_5m'][i]),'rsi':float(feature['rsi'][i]),
                 'funding':float(feature['funding_known_8h'][i]),
-                'raw_long':int(feature['stop_mode_long'][i]),'raw_short':int(feature['stop_mode_short'][i])})
+                'raw_long':int(feature['stop_mode_long'][i]),'raw_short':int(feature['stop_mode_short'][i]),
+                'source':getattr(self.api,'source','hyperliquid')})
         return rows
 
 
@@ -624,7 +701,7 @@ def entry_scan_text(row,signal=None,reason=None):
     else:ema_text=f'EMA {fp}/{sp} warm-up incomplete'
     close=values.get('close',row['close']);rsi=values.get('rsi',row['rsi']);funding=values.get('funding',row['funding'])
     rsi=float('nan') if rsi is None else rsi;funding=float('nan') if funding is None else funding
-    parts=[('SERVER ' if server else 'LOCAL ')+ema_text,
+    parts=['data '+str(values.get('source',row.get('source','unknown'))),('SERVER ' if server else 'LOCAL ')+ema_text,
            f'close {close:.2f}',f'RSI {rsi:.2f}',f'funding/8h {funding*100:+.6f}%']
     if reason:parts.append('BUY/SELL BLOCKED: '+str(reason))
     elif server:
@@ -1181,7 +1258,7 @@ from urllib.parse import urlparse
 
 ROOT=Path(__file__).resolve().parent
 VERSION='2.2.0'
-BUILD_ID='2.2.0-hyperliquid-diagnostics.1'
+BUILD_ID='2.2.0-binance-restored.1'
 # Public publisher policy is embedded in the release, never taken from customer config.
 # The publisher must insert their OWN public addresses before distribution.
 # This is a configuration safeguard, not protection against modifying source code.
@@ -1547,15 +1624,19 @@ class PaidAudit:
         must be; nothing here is computable locally."""
         self.activation()
         from algosdk.util import sign_bytes
-        body={'payer':self.cfg.payer,'signal_ms':int(row['time'])}
+        if row.get('source')!=MARKET_SOURCE:
+            raise Rejected('Legacy Hyperliquid position: managing its existing stop; additions paused until flat')
+        body={'payer':self.cfg.payer,'signal_ms':int(row['time']),'source':MARKET_SOURCE}
         raw=canonical(body).encode()
         headers={'Content-Type':'application/json','X-QTS-Payer':self.cfg.payer,'X-QTS-Signature':sign_bytes(raw,self.key)}
         try:
             response=self.session.post(self.cfg.endpoint+'/v1/signal/BTC',data=raw,headers=headers,timeout=(5,12),allow_redirects=False)
         except requests.RequestException as e:raise TemporaryError('Signal service unavailable ('+type(e).__name__+')') from None
         if response.status_code in (502,503,504):raise TemporaryError('Signal service busy; no entry this candle')
+        if response.status_code==409:raise Rejected('Signal source/version mismatch; update the client from the Windows release')
         if response.status_code!=200:raise Rejected('Signal service did not authorize an entry ('+str(response.status_code)+')')
         data=response.json()
+        if data.get('source')!=MARKET_SOURCE:raise Rejected('Service and client use different market data; update both')
         if data.get('signal') not in (-1,0,1):raise Rejected('Malformed signal from service')
         if data.get('signal_ms',row['time'])!=row['time']:raise Rejected('Service response belongs to a different candle')
         row['diagnostics']=data.get('diagnostics')
@@ -1993,7 +2074,7 @@ class AuditService:
         decision=feed.decision(signal_ms)
         if decision is None:raise ServiceError(422,'Unknown or not-yet-closed signal timestamp')
         signal,risk_atr=decision
-        result={'signal':signal,'risk_atr':risk_atr,'signal_ms':int(signal_ms),'decided_at_ms':self.now()}
+        result={'signal':signal,'risk_atr':risk_atr,'signal_ms':int(signal_ms),'decided_at_ms':self.now(),'source':MARKET_SOURCE}
         if hasattr(feed,'explain'):result['diagnostics']=feed.explain(signal_ms)
         return result
 
@@ -2039,9 +2120,10 @@ def validate_signal_request(body,payer,signature,now):
     from algosdk.encoding import is_valid_address
     from algosdk.util import verify_bytes
     try:
-        if not isinstance(body,dict) or set(body)!={'payer','signal_ms'}:raise ValueError()
+        if not isinstance(body,dict) or set(body) not in ({'payer','signal_ms'},{'payer','signal_ms','source'}):raise ValueError()
         raw=canonical(body).encode()
         if len(raw)>2000 or not is_valid_address(payer) or body['payer']!=payer or not verify_bytes(raw,signature,payer):raise ValueError()
+        if body.get('source')!=MARKET_SOURCE:raise ServiceError(409,'Update client: Binance BTCUSDC market data required')
         if isinstance(body['signal_ms'],bool) or not isinstance(body['signal_ms'],int):raise ValueError()
         if not 0<=now-int(body['signal_ms'])<=60_000:raise ServiceError(422,'Signal is no longer recent')
     except ServiceError:raise
@@ -2053,7 +2135,7 @@ class SignalFeed:
     publisher's PRIVATE estrategia.py, which is never distributed: this is the
     only place the entry signal and its risk ATR exist.
 
-    Recomputed at most every min_gap_ms so concurrent polls share one Hyperliquid
+    Recomputed at most every min_gap_ms so concurrent polls share one Binance
     fetch. The customer needs an activated account to request private signals."""
     def __init__(self,cfg,api=None,now=None,min_gap_ms=15_000,strategy=None):
         import threading
@@ -2064,19 +2146,34 @@ class SignalFeed:
                 raise SafetyError('estrategia.py is missing: the private entry engine must be deployed with the service') from None
         self.strategy=strategy
         self.now=now or (lambda:int(time.time()*1000));self.min_gap=min_gap_ms
-        self.api=api or PublicAPI(cfg.network)
+        self.api=api or BinanceDataAPI()
         folder=service_state_dir(cfg)
-        self.store=Store(folder/'senal.sqlite3',same_thread=False)
+        self.store=Store(folder/'senal_binance_btcusdc_v1.sqlite3',same_thread=False)
         self.management=Config(**DEFAULT_MANAGEMENT);self.stop=StopConfig(**DEFAULT_STOP)
         self.management.validate();self.stop.validate()
         self.market=Market(self.api,self.store,self.management,StopIndicators(),self.stop,
                            logging.getLogger('quant_trading_signals.senal'),delay_seconds=2)
         self.lock=threading.Lock();self.table={};self.reports={};self.fetched=0
+        self.warm_thread=None
+
+    def start_warming(self):
+        import threading
+        def work():
+            while True:
+                try:
+                    now=self.now()
+                    self.decision((now-2000)//BAR_MS*BAR_MS)
+                except Exception as error:
+                    logging.getLogger('quant_trading_signals.senal').warning('BINANCE SIGNAL WARMUP | %s',type(error).__name__)
+                time.sleep(15)
+        if self.warm_thread is None:
+            self.warm_thread=threading.Thread(target=work,name='binance-signal-cache',daemon=True)
+            self.warm_thread.start()
 
     def decision(self,signal_ms):
         """(signal, risk_atr) for that closed candle, or None if unknown."""
         with self.lock:
-            if self.now()-self.fetched>=self.min_gap:
+            if self.now()-self.fetched>=self.min_gap and ((self.now()-2000)//BAR_MS*BAR_MS not in self.table):
                 self.market.sync(self.now())
                 manifest=self.store.get('market_manifest')
                 data={'BTC_5m.json':self.store.candles('5m'),
@@ -2123,7 +2220,9 @@ def make_service_app(cfg,service=None,feed=None):
         private_path=Path(__file__).with_name('estrategia.py')
         return {'status':'ok','project':'QUANT TRADING SIGNALS','version':VERSION,'build':BUILD_ID,
                 'agent_sha256':hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-                'strategy_sha256':hashlib.sha256(private_path.read_bytes()).hexdigest() if private_path.is_file() else None}
+                'strategy_sha256':hashlib.sha256(private_path.read_bytes()).hexdigest() if private_path.is_file() else None,
+                'signal_source':MARKET_SOURCE,
+                'signal_last_closed_ms':max(lazy['feed'].table,default=None) if lazy['feed'] else None}
     @app.get('/v1/terms')
     def terms():return cfg.terms()
     # Request must be in globals to resolve FastAPI's postponed annotations.
@@ -2164,6 +2263,7 @@ def serve_api(cfg):
     import uvicorn
     cfg.merchant_ready()
     service=AuditService(cfg);feed=SignalFeed(cfg)  # fail fast: no engine, no service
+    feed.start_warming()
     supported=service.facilitator.get_supported()
     if not any(k.network==cfg.chain and k.scheme=='exact' and k.x402_version==2 and
                (k.extra or {}).get('feePayer')==cfg.fee_payer for k in supported.kinds):
@@ -2193,7 +2293,7 @@ def run_agent(cfg,paper=False,once=False):
     path=cfg.root/'estado'/(mode+'_'+cfg.network+'_'+identity(account_key)[:16]+'.sqlite3')
     with OneInstance(account_key):
         log=configure_log(cfg.root/'log.txt',mode)
-        store=Store(path);payments=None;agent=None
+        store=Store(path);payments=None;agent=None;market_store=None
         try:
             log.info('START QUANT TRADING SIGNALS | BTC/USDC perpetual 5m | %s | %.2f%% notional per entry | isolated 5x | maximum 3 entries',cfg.network,settings['capital_per_entry_pct'])
             api=PublicAPI(cfg.network);meta=api.meta()
@@ -2214,9 +2314,22 @@ def run_agent(cfg,paper=False,once=False):
             else:
                 decimals=int(next(x for x in meta['universe'] if x['name']=='BTC')['szDecimals'])
                 broker=PaperBroker(api,store,now,10000.,decimals,DEFAULT_MANAGEMENT['fee_rate'],settings['entry_slippage_bps'])
-                log.info('PAPER MONITOR | public Hyperliquid data only | private entry signals disabled | no orders or payments')
+                log.info('PAPER MONITOR | public Binance indicators / Hyperliquid quotes | private entry signals disabled | no orders or payments')
             agent=QTSAgent(broker,store,cfg.management,cfg.stop,settings,log,now,payments=payments)
-            market=Market(api,store,cfg.management,cfg.indicators,cfg.stop,log,settings['retardo_cierre_segundos'])
+            legacy=agent.active() and agent.state.get('market_source')!=MARKET_SOURCE
+            market_store=Store(cfg.root/'estado'/'binance_btcusdc_v1.sqlite3')
+            binance=BinanceDataAPI(log,progress=lambda:agent.poll() if agent.active() else None)
+            def select_market(legacy):
+                return Market(api if legacy else binance,store if legacy else market_store,
+                              cfg.management,cfg.indicators,cfg.stop,log,settings['retardo_cierre_segundos'])
+            market=select_market(legacy)
+            if legacy:
+                log.warning('LEGACY POSITION | retaining Hyperliquid stop inputs until flat; no additions; Binance starts afterwards')
+            else:
+                if agent.state.get('market_source')!=MARKET_SOURCE:
+                    agent.state['last_bar']=0
+                agent.state['market_source']=MARKET_SOURCE;agent.save()
+            log.info('DATA | indicators and published funding: Binance USD-M BTCUSDC | execution and native stops: Hyperliquid | basis limit 0.30%%')
             delay=int(settings['retardo_cierre_segundos']*1000)
             scan_due=0;poll_due=0;pay_due=0;failures=0
             while True:
@@ -2225,6 +2338,11 @@ def run_agent(cfg,paper=False,once=False):
                     try:
                         # Protection first; a payment provider being down never stops these calls.
                         agent.poll();poll_due=now()+settings['revision_posicion_segundos']*1000
+                        if legacy and not agent.active():
+                            legacy=False;market=select_market(False)
+                            agent.state['last_bar']=0;agent.state['market_source']=MARKET_SOURCE;agent.save()
+                            scan_due=0
+                            log.info('BINANCE DATA ACTIVATED | legacy position closed; initializing a fresh scan baseline')
                         if now()>=scan_due:
                             agent.process_rows(market.sync(now()))
                             scan_due=next_close(now(),delay)
@@ -2252,6 +2370,7 @@ def run_agent(cfg,paper=False,once=False):
             if agent and agent.active():log.warning('STOPPED | state saved; confirmed live stop remains but will not advance until restart')
             else:log.info('STOPPED | state saved')
             if payments:payments.close()
+            if market_store:market_store.close()
             store.close()
     return 0
 
