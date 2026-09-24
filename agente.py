@@ -604,10 +604,42 @@ class Market:
         rows=[]
         for i,b in feature['bars'].iterrows():
             rows.append({'time':int(b['T'])+1,'open_time':int(b['t']),'close':float(b['c']),
+                'ema_fast':float(feature['ema_fast'][i]),'ema_slow':float(feature['ema_slow'][i]),
                 'atr':float(feature['stop_atr_5m'][i]),'rsi':float(feature['rsi'][i]),
                 'funding':float(feature['funding_known_8h'][i]),
                 'raw_long':int(feature['stop_mode_long'][i]),'raw_short':int(feature['stop_mode_short'][i])})
         return rows
+
+
+def entry_scan_text(row,signal=None,reason=None):
+    """English, one-line explanation. Private filter results come from the server."""
+    details=row.get('diagnostics')
+    server=isinstance(details,dict) and details.get('signal_ms')==row['time']
+    values=details if server else row
+    fast,slow=values.get('ema_fast'),values.get('ema_slow')
+    fp,sp=values.get('ema_fast_period',34),values.get('ema_slow_period',89)
+    if fast is not None and slow is not None and math.isfinite(fast) and math.isfinite(slow):
+        alignment='BULLISH' if fast>slow else 'BEARISH' if fast<slow else 'FLAT'
+        ema_text=f'EMA {fp}/{sp} {alignment} ({fast:.2f}/{slow:.2f})'
+    else:ema_text=f'EMA {fp}/{sp} warm-up incomplete'
+    close=values.get('close',row['close']);rsi=values.get('rsi',row['rsi']);funding=values.get('funding',row['funding'])
+    rsi=float('nan') if rsi is None else rsi;funding=float('nan') if funding is None else funding
+    parts=[('SERVER ' if server else 'LOCAL ')+ema_text,
+           f'close {close:.2f}',f'RSI {rsi:.2f}',f'funding/8h {funding*100:+.6f}%']
+    if reason:parts.append('BUY/SELL BLOCKED: '+str(reason))
+    elif server:
+        for side,label,key in ((1,'BUY','buy_blocks'),(-1,'SELL','sell_blocks')):
+            blocks=details.get(key)
+            if not isinstance(blocks,list) or any(not isinstance(x,str) for x in blocks):
+                parts.append(label+': filter details unavailable')
+            elif blocks:parts.append(label+' NOT OPENED: '+'; '.join(blocks))
+            elif signal==side:parts.append(label+' SIGNAL PASSED; checking execution conditions')
+            else:parts.append(label+': server rejected entry; diagnostic mismatch')
+    elif signal:
+        parts.append(('BUY' if signal==1 else 'SELL')+' SIGNAL PASSED; checking execution conditions')
+    else:
+        parts.append('BUY/SELL NOT OPENED: server returned no signal; this server version does not provide filter reasons')
+    return ' | '.join(parts)
 
 
 # ========================================================================
@@ -1068,6 +1100,8 @@ class Agent:
             self.event('%s | history initialized; waiting for the next 5-minute close',
                        'SCANNING PAUSED' if self.state['blocked'] else
                        'POSITION RECOVERED' if self.state['position'] else 'NO OPEN POSITIONS')
+            if not self.state['position']:
+                self.event('NO OPEN POSITIONS | %s',entry_scan_text(rows[-1],reason='startup baseline recorded; waiting for the next closed 5m candle'))
             return
         new=[r for r in rows if r['time']>self.state['last_bar']]
         if not new:return
@@ -1080,10 +1114,15 @@ class Agent:
             self.state['last_bar']=row['time'];self.save()
         last=new[-1]
         self.ensure_stop()
-        if self.state['blocked'] or self.state['pending']:return
+        if self.state['blocked'] or self.state['pending']:
+            if not self.state['position']:
+                reason=self.state['blocked'] or ('order reconciliation pending: '+', '.join(self.state['pending']))
+                self.event('NO OPEN POSITIONS | %s',entry_scan_text(last,reason=reason))
+            return
         fresh=0<=self.now()-last['time']<=self.settings['max_edad_senal_segundos']*1000
         if not fresh:
-            self.event('STALE CANDLE | stop reconciled; historical entries will not be executed');return
+            reason=f'closed candle age {(self.now()-last["time"])/1000:.1f}s is outside 0-{self.settings["max_edad_senal_segundos"]}s; historical entries are not replayed'
+            self.event('STALE CANDLE | %s | protection reconciled',entry_scan_text(last,reason=reason));return
         p=self.state['position']
         if p:
             if p['emergency'] or p['additions_disabled']:return
@@ -1103,11 +1142,12 @@ class Agent:
         else:
             if last['time']<=self.state['closed_at']:return
             decision=self.entry_decision(last)
-            if decision is None:return
+            if decision is None:
+                self.event('NO OPEN POSITIONS | %s',entry_scan_text(last,reason=last.get('entry_block','signal service unavailable')))
+                return
             signal,risk_atr=decision
-            self.event('NO OPEN POSITIONS | scanning BTC/USDC 5m | close %.2f | RSI %.2f | known funding %+.6f%% | signal %s',
-                last['close'],last['rsi'],last['funding']*100,
-                'BUY' if signal==1 else 'SELL' if signal==-1 else 'none')
+            reason='initial-stop ATR unavailable' if signal and not math.isfinite(risk_atr) else None
+            self.event('NO OPEN POSITIONS | BTC/USDC 5m | %s',entry_scan_text(last,signal,reason))
             if signal and math.isfinite(risk_atr):
                 self.open_entry(dict(last,signal=signal,risk_atr=risk_atr))
 
@@ -1117,12 +1157,15 @@ class Agent:
         open positions. Any position already open keeps its local protection."""
         hook=getattr(self,'ask_service',None)
         if hook is None:
+            row['entry_block']='no signal service configured'
             self.log.warning('ENTRY SKIPPED | no signal service configured');return None
         try:
             return hook(row)
         except Rejected as e:
+            row['entry_block']='service rejected request: '+str(e)
             self.event('ENTRY PAUSED BY SERVICE | %s | existing protection remains active',e);return None
         except TemporaryError as e:
+            row['entry_block']='signal service unavailable: '+str(e)
             self.event('SIGNAL SERVICE UNAVAILABLE | %s | no entry this candle; protection unaffected',e);return None
 
 
@@ -1138,6 +1181,7 @@ from urllib.parse import urlparse
 
 ROOT=Path(__file__).resolve().parent
 VERSION='2.2.0'
+BUILD_ID='2.2.0-hyperliquid-diagnostics.1'
 # Public publisher policy is embedded in the release, never taken from customer config.
 # The publisher must insert their OWN public addresses before distribution.
 # This is a configuration safeguard, not protection against modifying source code.
@@ -1172,6 +1216,8 @@ class Settings:
         self.path=Path(path).resolve();self.root=self.path.parent
         self.ini=configparser.ConfigParser(interpolation=None)
         if not self.ini.read(self.path,encoding='utf-8-sig'):raise SafetyError('Missing config.txt next to the agent')
+        for section in ('account','operations','billing','setup'):
+            if not self.ini.has_section(section):self.ini.add_section(section)
         for section in self.ini.sections():
             for key in self.ini[section]:
                 if any(x in key.lower() for x in ('semilla','private','secret','password','mnemonic')):
@@ -1218,8 +1264,17 @@ class Settings:
         self.management.validate();self.indicators.validate();self.stop.validate()
 
     def get(self,section,key):
-        try:return self.ini[section][key].strip()
-        except KeyError:raise SafetyError(f'Missing [{section}] {key} in config.txt') from None
+        defaults={('account','network'):'mainnet',('account','mode'):'paper',
+            ('account','wallet_hyperliquid'):'',('account','wallet_algorand_payments'):'',
+            ('operations','capital_per_entry_pct'):'100',('operations','max_entries'):'3',
+            ('billing','daily_limit_usdc'):'0.50',('billing','total_limit_usdc'):'10.00',
+            ('billing','algod_url'):'https://'+('testnet' if self.ini.get('account','network',fallback='mainnet').strip()=='testnet' else 'mainnet')+'-api.algonode.cloud',
+            ('setup','completed'):'no',('setup','acceptance_sha256'):'',
+            ('server','facilitator_url'):'https://facilitator.goplausible.xyz',
+            ('server','host'):'127.0.0.1',('server','port'):'8000'}
+        value=self.ini.get(section,key,fallback=defaults.get((section,key)))
+        if value is None:raise SafetyError(f'Missing [{section}] {key} in config.txt')
+        return value.strip()
 
     def micro(self,key):
         value=Decimal(self.get('billing',key))*1_000_000
@@ -1502,6 +1557,8 @@ class PaidAudit:
         if response.status_code!=200:raise Rejected('Signal service did not authorize an entry ('+str(response.status_code)+')')
         data=response.json()
         if data.get('signal') not in (-1,0,1):raise Rejected('Malformed signal from service')
+        if data.get('signal_ms',row['time'])!=row['time']:raise Rejected('Service response belongs to a different candle')
+        row['diagnostics']=data.get('diagnostics')
         return int(data['signal']),float(data.get('risk_atr',float('nan')))
 
     def queue_exit(self,position,closed_time,price,realized):
@@ -1575,9 +1632,10 @@ class QTSAgent(Agent):
         """Entry decisions come from the paid service. Paper mode runs the
         agent's plumbing without it, so it simply never enters."""
         if self.broker.mode=='paper':
-            self.event('PAPER MODE | entry signals come from the paid service and are not requested here')
+            row['entry_block']='paper monitor mode; private entry signals are not requested and no orders are opened'
             return None
         if not self.payments:
+            row['entry_block']='payment credential unavailable; private signal cannot be requested'
             self.log.warning('ENTRY SKIPPED | payment credential unavailable; stops and exits remain active');return None
         return self.payments.entry_signal(row)
     def before_entry(self,row,side,qty,distance,is_add,level):
@@ -1778,7 +1836,7 @@ def configure_wizard(cfg,input_fn=input,password_fn=getpass.getpass,vault=None,a
     print('Hyperliquid exchange fee: base taker rate 0.045% per fill, separate; account tier/discounts may change it. Funding is variable.')
     print(f'x402: {cfg.price/1e6:.6f} USDC per one-time activation and per full-position exit receipt. Recipient: {cfg.pay_to}')
     print(f'x402 limits: {cfg.daily/1e6:.2f} USDC/day UTC, {cfg.total/1e6:.2f} USDC total for this installation. Algorand transaction fees are covered by the sponsor.')
-    print('Both fees are charged only when a position closes. Opening entries never require payment, and stops/exits never wait for payment.')
+    print('A one-time activation payment is required before the first private signal. Developer commission and exit receipts apply on close; protective exits never wait for payment.')
     print('The service receives public addresses and trade data for auditing; it never receives your keys.')
     terms=requests.get(cfg.endpoint+'/v1/terms',timeout=12,allow_redirects=False)
     if terms.status_code!=200 or terms.json()!=cfg.terms():raise SafetyError('Service terms do not match config.txt')
@@ -1935,7 +1993,9 @@ class AuditService:
         decision=feed.decision(signal_ms)
         if decision is None:raise ServiceError(422,'Unknown or not-yet-closed signal timestamp')
         signal,risk_atr=decision
-        return {'signal':signal,'risk_atr':risk_atr,'decided_at_ms':self.now()}
+        result={'signal':signal,'risk_atr':risk_atr,'signal_ms':int(signal_ms),'decided_at_ms':self.now()}
+        if hasattr(feed,'explain'):result['diagnostics']=feed.explain(signal_ms)
+        return result
 
     def handle(self,body,payer,signature,payment_header=None):
         from x402.schemas import PaymentPayload
@@ -1994,7 +2054,7 @@ class SignalFeed:
     only place the entry signal and its risk ATR exist.
 
     Recomputed at most every min_gap_ms so concurrent polls share one Hyperliquid
-    fetch. Keeping this server-side is what makes payment unavoidable for entries."""
+    fetch. The customer needs an activated account to request private signals."""
     def __init__(self,cfg,api=None,now=None,min_gap_ms=15_000,strategy=None):
         import threading
         if strategy is None:
@@ -2011,7 +2071,7 @@ class SignalFeed:
         self.management.validate();self.stop.validate()
         self.market=Market(self.api,self.store,self.management,StopIndicators(),self.stop,
                            logging.getLogger('quant_trading_signals.senal'),delay_seconds=2)
-        self.lock=threading.Lock();self.table={};self.fetched=0
+        self.lock=threading.Lock();self.table={};self.reports={};self.fetched=0
 
     def decision(self,signal_ms):
         """(signal, risk_atr) for that closed candle, or None if unknown."""
@@ -2022,8 +2082,16 @@ class SignalFeed:
                 data={'BTC_5m.json':self.store.candles('5m'),
                       f'BTC_{self.strategy.DEFAULT_STRATEGY["context_hours"]}h.json':self.store.candles('12h'),
                       'BTC_funding.json':self.store.funding()}
-                self.table=self.strategy.entry_rows(data,manifest);self.fetched=self.now()
+                if hasattr(self.strategy,'entry_report'):
+                    recent={int(x['T'])+1 for x in data['BTC_5m.json'][-2:]}
+                    self.table,self.reports=self.strategy.entry_report(data,manifest,report_times=recent)
+                else:
+                    self.table=self.strategy.entry_rows(data,manifest);self.reports={}
+                self.fetched=self.now()
             return self.table.get(int(signal_ms))
+
+    def explain(self,signal_ms):
+        with self.lock:return self.reports.get(int(signal_ms))
 
 
 def service_state_dir(cfg):
@@ -2051,7 +2119,11 @@ def make_service_app(cfg,service=None,feed=None):
         if lazy['feed'] is None:lazy['feed']=SignalFeed(cfg)
         return lazy['feed']
     @app.get('/health')
-    def health():return {'status':'ok','project':'QUANT TRADING SIGNALS','version':VERSION}
+    def health():
+        private_path=Path(__file__).with_name('estrategia.py')
+        return {'status':'ok','project':'QUANT TRADING SIGNALS','version':VERSION,'build':BUILD_ID,
+                'agent_sha256':hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                'strategy_sha256':hashlib.sha256(private_path.read_bytes()).hexdigest() if private_path.is_file() else None}
     @app.get('/v1/terms')
     def terms():return cfg.terms()
     # Request must be in globals to resolve FastAPI's postponed annotations.
@@ -2142,7 +2214,7 @@ def run_agent(cfg,paper=False,once=False):
             else:
                 decimals=int(next(x for x in meta['universe'] if x['name']=='BTC')['szDecimals'])
                 broker=PaperBroker(api,store,now,10000.,decimals,DEFAULT_MANAGEMENT['fee_rate'],settings['entry_slippage_bps'])
-                log.info('PAPER | no real orders or payments | public Hyperliquid data, simulated balance')
+                log.info('PAPER MONITOR | public Hyperliquid data only | private entry signals disabled | no orders or payments')
             agent=QTSAgent(broker,store,cfg.management,cfg.stop,settings,log,now,payments=payments)
             market=Market(api,store,cfg.management,cfg.indicators,cfg.stop,log,settings['retardo_cierre_segundos'])
             delay=int(settings['retardo_cierre_segundos']*1000)
@@ -2191,7 +2263,7 @@ def main(argv=None):
     group.add_argument('--configurar',action='store_true',help='Required guided setup before live trading')
     group.add_argument('--preparar-publicacion',action='store_true',help='Publisher: set public recipients and service URL')
     group.add_argument('--servir',action='store_true',help='Publisher: run the x402 API; no trading or customer keys required')
-    group.add_argument('--paper',action='store_true',help='Simulation without keys or real charges')
+    group.add_argument('--paper',action='store_true',help='Public-data monitor; no private entry signals, orders or payments')
     parser.add_argument('--once',action='store_true',help='Run one cycle and exit; live mode may submit orders')
     args=parser.parse_args(argv)
     try:
@@ -2207,4 +2279,3 @@ def main(argv=None):
         print('CANNOT CONTINUE |',type(error).__name__,'| credentials are not displayed. Check connectivity and README.md.');return 1
 
 if __name__=='__main__':raise SystemExit(main())
-
