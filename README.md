@@ -10,7 +10,7 @@ A local BTC/USDC trading agent: **Binance USD-M BTCUSDC data**, with **orders an
 4. Review the fees, approve the developer fee in your wallet, and wait for **SETUP COMPLETE**. Setup does not start trading.
 5. Open **INICIAR.bat** and keep the window open and the computer awake.
 
-You need at least **100 USDC in Hyperliquid futures equity** and **2 USDC in the Algorand payment wallet**. The Algorand wallet must be activated and opted in to USDC; its minimum ALGO reserve is separate from the 2 USDC. Payment transaction fees are sponsored.
+You need at least **10 USDC in Hyperliquid futures equity** and **2 USDC in the Algorand payment wallet**. The Algorand wallet must be activated and opted in to USDC; its minimum ALGO reserve is separate from the 2 USDC. Payment transaction fees are sponsored.
 
 Keys stay in **Windows Credential Manager**, never in `config.txt` or the log. Use the same Windows account on restart. `config.txt` contains only public wallet addresses, mode, position percentage and payment spending limits. The installer adds its setup verification fields automatically; do not edit those fields.
 
@@ -21,7 +21,7 @@ Keys stay in **Windows Credential Manager**, never in `config.txt` or the log. U
 - To restart, press **Ctrl+C in the agent window**, wait for **STOPPED**, close that window, then open **INICIAR.bat once** from the **same folder**. Keep `config.txt`, `.venv` and `estado/`. Do not run setup again for an ordinary restart.
 - Restart checks saved state against Hyperliquid before acting. It does not replay missed historical entries. A confirmed exchange stop remains while the agent is stopped, but it does not keep advancing.
 - `log.txt` starts a new session on restart. Copy it first if you want to keep the previous session. Trading and payment state remain in `estado/`.
-- **PROBAR_PAPER.bat** is a public-data monitor. It needs no keys, makes no payments, and **does not simulate the private entry strategy**.
+
 
 This build is **2.2.0-binance-restored.1**. It includes `binance_seed.zip`, a verified public-data cache with the original indicator seed. The cache then updates from Binance. Keep it beside `agente.py`. Historical entries are never opened on installation or restart.
 
